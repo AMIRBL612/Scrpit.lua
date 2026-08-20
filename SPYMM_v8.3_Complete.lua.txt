@@ -1,0 +1,432 @@
+local Rifled = loadstring(game:HttpGet("https://raw.githubusercontent.com/rifledpro/Rifled/main/Source.lua"))()
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+
+local player = Players.LocalPlayer
+local char = player.Character or player.CharacterAdded:Wait()
+local rootPart = char:WaitForChild("HumanoidRootPart")
+local humanoid = char:WaitForChild("Humanoid")
+local camera = workspace.CurrentCamera
+
+local config = getgenv().STA or {}
+config.espItems = true
+config.espCrates = true
+config.espMobs = true
+config.espPlayers = true
+config.espRange = 100
+config.espUpdateRate = 0.1
+config.silentAim = false
+config.killAura = false
+config.hitboxScale = 1
+config.damagePerTick = 15
+config.killAuraRange = 25
+config.auraRate = 0.05
+config.autoPickup = false
+config.autoCraft = false
+config.pickupRange = 30
+config.craftSpeed = 0.1
+config.speedHack = 1
+config.pickupRate = 0.08
+config.infiniteJump = false
+config.noClip = false
+config.autoSprint = false
+config.bunnyHop = false
+config.chamsEnabled = false
+config.chamsOpacity = 0.5
+config.chamsColor = Color3.fromRGB(255, 0, 0)
+config.antiFootsteps = true
+config.antiAnalytics = true
+config.smoothPhysics = true
+getgenv().STA = config
+
+local espCache = {}
+local lastESPUpdate = 0
+local chamsParts = {}
+local lastAuraUpdate = 0
+local lastDamageTick = {}
+local itemCache = {}
+local lastPickupTime = 0
+local lastCraftTime = 0
+local canJump = true
+
+local espColors = {
+  ["Gun"] = Color3.fromRGB(255, 0, 0),
+  ["Melee"] = Color3.fromRGB(255, 165, 0),
+  ["Medical"] = Color3.fromRGB(0, 255, 0),
+  ["Armor"] = Color3.fromRGB(0, 0, 255),
+  ["Food"] = Color3.fromRGB(50, 205, 50),
+  ["Resource"] = Color3.fromRGB(0, 255, 255),
+  ["Fuel"] = Color3.fromRGB(255, 215, 0),
+  ["Ability"] = Color3.fromRGB(128, 0, 255)
+}
+
+local function getESPColor(itemType)
+  for cat, col in pairs(espColors) do
+    if itemType:lower():find(cat:lower()) then return col end
+  end
+  return Color3.fromRGB(0, 255, 100)
+end
+
+local function createBillboard(instance, label, color)
+  if espCache[instance] then return end
+  
+  local bb = Instance.new("BillboardGui")
+  bb.Size = UDim2.new(4, 0, 2, 0)
+  bb.MaxDistance = config.espRange
+  bb.Parent = instance
+  
+  local txt = Instance.new("TextLabel")
+  txt.BackgroundTransparency = 1
+  txt.TextScaled = true
+  txt.TextColor3 = color
+  txt.TextSize = 12
+  txt.Text = label
+  txt.Parent = bb
+  
+  espCache[instance] = {bb = bb, txt = txt}
+end
+
+local function cleanESP()
+  for obj, data in pairs(espCache) do
+    if not obj or obj.Parent == nil then
+      data.bb:Destroy()
+      espCache[obj] = nil
+    end
+  end
+end
+
+local function scanItems()
+  if not config.espItems then return end
+  for _, item in pairs(workspace:FindPartBySurroundingRadius(rootPart.Position, config.espRange):GetChildren() or {}) do
+    if item:IsA("BasePart") and item.Parent ~= char and item.Parent:FindFirstChild("Handle") then
+      local dist = (item.Position - rootPart.Position).Magnitude
+      local col = getESPColor(item.Parent.Name)
+      createBillboard(item, string.format("Item [%.0f]", dist), col)
+    end
+  end
+end
+
+local function scanCrates()
+  if not config.espCrates then return end
+  for _, crate in pairs(workspace:GetDescendants()) do
+    if crate:IsA("BasePart") and crate.Name:lower():find("crate") then
+      local dist = (crate.Position - rootPart.Position).Magnitude
+      if dist < config.espRange then
+        createBillboard(crate, string.format("Crate [%.0f]", dist), Color3.fromRGB(255, 200, 0))
+      end
+    end
+  end
+end
+
+local function scanMobs()
+  if not config.espMobs then return end
+  for _, mob in pairs(workspace:GetDescendants()) do
+    if mob:IsA("Humanoid") and mob.Parent ~= char then
+      local root = mob.Parent:FindFirstChild("HumanoidRootPart")
+      if root then
+        local dist = (root.Position - rootPart.Position).Magnitude
+        if dist < config.espRange then
+          createBillboard(root, string.format("%s [%.0f]", mob.Parent.Name, dist), Color3.fromRGB(255, 0, 0))
+        end
+      end
+    end
+  end
+end
+
+local function cacheMobs()
+  local mobs = {}
+  for _, mob in pairs(workspace:GetDescendants()) do
+    if mob:IsA("Humanoid") and mob.Parent ~= char and mob.Health > 0 then
+      local root = mob.Parent:FindFirstChild("HumanoidRootPart")
+      if root then table.insert(mobs, {h = mob, r = root}) end
+    end
+  end
+  return mobs
+end
+
+local function silentAim(mobs)
+  if not config.silentAim then return end
+  local closest, closestDist = nil, math.huge
+  for _, m in ipairs(mobs) do
+    local d = (m.r.Position - rootPart.Position).Magnitude
+    if d < closestDist then closest, closestDist = m.r, d end
+  end
+  if closest then
+    local dir = (closest.Position - camera.CFrame.Position).Unit
+    camera.CFrame = CFrame.new(camera.CFrame.Position, camera.CFrame.Position + dir)
+  end
+end
+
+local function killAura(mobs)
+  if not config.killAura then return end
+  local now = tick()
+  for _, m in ipairs(mobs) do
+    local d = (m.r.Position - rootPart.Position).Magnitude
+    if d < config.killAuraRange then
+      if not lastDamageTick[m.h] or (now - lastDamageTick[m.h]) >= config.auraRate then
+        m.h:TakeDamage(config.damagePerTick)
+        lastDamageTick[m.h] = now
+      end
+    end
+  end
+end
+
+local function expandHitbox(mobs)
+  if config.hitboxScale == 1 then return end
+  for _, m in ipairs(mobs) do
+    for _, p in pairs(m.h.Parent:GetDescendants()) do
+      if p:IsA("BasePart") and not p:GetAttribute("_hb") then
+        p.Size = p.Size * config.hitboxScale
+        p:SetAttribute("_hb", true)
+      end
+    end
+  end
+end
+
+local function gatherItems()
+  if not config.autoPickup then return end
+  local now = tick()
+  if now - lastPickupTime < config.pickupRate then return end
+  
+  for _, item in pairs(workspace:FindPartBySurroundingRadius(rootPart.Position, config.pickupRange):GetChildren() or {}) do
+    if item:IsA("BasePart") and item.Parent ~= char and item.Parent:FindFirstChild("Handle") then
+      if not itemCache[item.Parent] then
+        pcall(function()
+          item.Parent:MoveTo(rootPart.Position + Vector3.new(0, 2, 0))
+        end)
+        itemCache[item.Parent] = true
+        task.wait(0.01)
+      end
+    end
+  end
+  lastPickupTime = now
+end
+
+local function craftBatch()
+  if not config.autoCraft then return end
+  local now = tick()
+  if now - lastCraftTime < config.craftSpeed then return end
+  
+  local cr = workspace:FindFirstChild("Craft") or game.ReplicatedStorage:FindFirstChild("Craft")
+  if cr and cr:IsA("RemoteEvent") then
+    for i = 1, 50 do
+      task.spawn(function()
+        pcall(function()
+          cr:FireServer("AutoCraft", math.random(1, 5))
+        end)
+      end)
+    end
+    lastCraftTime = now
+  end
+end
+
+local function applySpeed()
+  humanoid.WalkSpeed = 16 * config.speedHack
+end
+
+local function infiniteJumpSetup()
+  if not config.infiniteJump then return end
+  humanoid.StateChanged:Connect(function(_, newState)
+    if newState == Enum.HumanoidStateType.Landed then
+      canJump = true
+    end
+  end)
+end
+
+local function noClip()
+  if not config.noClip then return end
+  for _, p in pairs(char:GetDescendants()) do
+    if p:IsA("BasePart") then p.CanCollide = false end
+  end
+end
+
+local function bunnyHop()
+  if not config.bunnyHop or humanoid.Health <= 0 then return end
+  if humanoid.MoveDirection.Magnitude > 0 then
+    humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+  end
+end
+
+local function applyChams(part, color)
+  if chamsParts[part] then return end
+  
+  local hl = Instance.new("Highlight")
+  hl.FillColor = color
+  hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+  hl.FillTransparency = 1 - config.chamsOpacity
+  hl.Parent = part
+  chamsParts[part] = hl
+end
+
+local function scanChams()
+  if not config.chamsEnabled then return end
+  for _, z in pairs(workspace:GetDescendants()) do
+    if z:IsA("Humanoid") and z.Parent ~= char then
+      local r = z.Parent:FindFirstChild("HumanoidRootPart")
+      if r then applyChams(r, Color3.fromRGB(255, 0, 0)) end
+    end
+  end
+end
+
+local function cleanChams()
+  for p, h in pairs(chamsParts) do
+    if not p or p.Parent == nil then
+      h:Destroy()
+      chamsParts[p] = nil
+    end
+  end
+end
+
+local function stripFootsounds()
+  if not config.antiFootsteps then return end
+  local c = player.Character
+  if c then
+    for _, s in pairs(c:GetDescendants()) do
+      if s:IsA("Sound") and s.Name:lower():find("foot") then
+        s.Volume = 0
+      end
+    end
+  end
+end
+
+local function bypassAnalytics()
+  if not config.antiAnalytics then return end
+  local oldGet = game.HttpGet
+  game.HttpGet = function(self, url)
+    if url:lower():find("analytics") or url:lower():find("telemetry") or url:lower():find("log") then
+      return "{}"
+    end
+    return oldGet(self, url)
+  end
+end
+
+local function smoothPhys()
+  if not config.smoothPhysics then return end
+  local c = player.Character
+  if c then
+    for _, p in pairs(c:GetDescendants()) do
+      if p:IsA("BasePart") then
+        p.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.3, 0.5)
+      end
+    end
+  end
+end
+
+local function saveConfig()
+  local save = {}
+  for k, v in pairs(config) do
+    if type(v) ~= "function" then save[k] = v end
+  end
+  setclipboard(HttpService:JSONEncode(save))
+  print("[SPYMM] Config copied to clipboard")
+end
+
+local function loadConfig()
+  local clip = getclipboard()
+  if clip then
+    local decoded = HttpService:JSONDecode(clip)
+    for k, v in pairs(decoded) do
+      config[k] = v
+    end
+    print("[SPYMM] Config loaded")
+  end
+end
+
+local Window = Rifled:CreateWindow({Title = "SPYMM v8.3", Size = UDim2.new(0, 500, 0, 600)})
+
+local VisualsTab = Window:AddTab("Visuals")
+VisualsTab:AddToggle("Item ESP", config.espItems, function(v) config.espItems = v end)
+VisualsTab:AddToggle("Crate ESP", config.espCrates, function(v) config.espCrates = v end)
+VisualsTab:AddToggle("Mob ESP", config.espMobs, function(v) config.espMobs = v end)
+VisualsTab:AddToggle("Player ESP", config.espPlayers, function(v) config.espPlayers = v end)
+VisualsTab:AddSlider("ESP Range", 10, 200, config.espRange, function(v) config.espRange = v end)
+
+local CombatTab = Window:AddTab("Combat")
+CombatTab:AddToggle("Silent Aim", config.silentAim, function(v) config.silentAim = v end)
+CombatTab:AddToggle("Kill Aura", config.killAura, function(v) config.killAura = v end)
+CombatTab:AddToggle("Hitbox Expand", config.hitboxScale > 1, function(v) config.hitboxScale = v and 3 or 1 end)
+CombatTab:AddSlider("Aura Range", 5, 50, config.killAuraRange, function(v) config.killAuraRange = v end)
+CombatTab:AddSlider("Damage/Tick", 5, 50, config.damagePerTick, function(v) config.damagePerTick = v end)
+
+local FarmTab = Window:AddTab("Farming")
+FarmTab:AddToggle("Auto Pickup", config.autoPickup, function(v) config.autoPickup = v end)
+FarmTab:AddSlider("Pickup Range", 10, 50, config.pickupRange, function(v) config.pickupRange = v end)
+FarmTab:AddToggle("Auto Craft", config.autoCraft, function(v) config.autoCraft = v end)
+FarmTab:AddSlider("Craft Speed", 0.01, 1, config.craftSpeed, function(v) config.craftSpeed = v end)
+FarmTab:AddToggle("Speed Hack", config.speedHack > 1, function(v) config.speedHack = v and 2.5 or 1 end)
+
+local MovTab = Window:AddTab("Movement")
+MovTab:AddToggle("Inf Jump", config.infiniteJump, function(v) config.infiniteJump = v; infiniteJumpSetup() end)
+MovTab:AddToggle("NoClip", config.noClip, function(v) config.noClip = v end)
+MovTab:AddToggle("Auto Sprint", config.autoSprint, function(v) config.autoSprint = v end)
+MovTab:AddToggle("Bunny Hop", config.bunnyHop, function(v) config.bunnyHop = v end)
+
+local ChamsTab = Window:AddTab("Chams")
+ChamsTab:AddToggle("Enable Chams", config.chamsEnabled, function(v) config.chamsEnabled = v end)
+ChamsTab:AddSlider("Opacity", 0.1, 1, config.chamsOpacity, function(v) config.chamsOpacity = v end)
+
+local BypassTab = Window:AddTab("Anti-Detection")
+BypassTab:AddToggle("Anti Footsteps", config.antiFootsteps, function(v) config.antiFootsteps = v; stripFootsounds() end)
+BypassTab:AddToggle("Anti Analytics", config.antiAnalytics, function(v) config.antiAnalytics = v; bypassAnalytics() end)
+BypassTab:AddToggle("Smooth Physics", config.smoothPhysics, function(v) config.smoothPhysics = v; smoothPhys() end)
+BypassTab:AddButton("Force GC", function() collectgarbage("collect") end)
+
+local SettingsTab = Window:AddTab("Settings")
+SettingsTab:AddButton("Save Config", saveConfig)
+SettingsTab:AddButton("Load Config", loadConfig)
+SettingsTab:AddButton("Reset All", function() getgenv().STA = {} print("[SPYMM] Reset complete") end)
+SettingsTab:AddLabel("SPYMM v8.3 - Rifled Edition")
+SettingsTab:AddLabel("All features integrated & optimized")
+
+UserInputService.InputBegan:Connect(function(input, gp)
+  if gp then return end
+  if input.KeyCode == Enum.KeyCode.Space and config.infiniteJump and canJump then
+    humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+    canJump = false
+  end
+end)
+
+RunService.Heartbeat:Connect(function()
+  if not char or humanoid.Health <= 0 then return end
+  
+  local now = tick()
+  if now - lastESPUpdate >= config.espUpdateRate then
+    scanItems()
+    scanCrates()
+    scanMobs()
+    cleanESP()
+    lastESPUpdate = now
+  end
+  
+  if now - lastAuraUpdate >= config.auraRate then
+    local mobs = cacheMobs()
+    silentAim(mobs)
+    killAura(mobs)
+    expandHitbox(mobs)
+    lastAuraUpdate = now
+  end
+  
+  gatherItems()
+  craftBatch()
+  applySpeed()
+  noClip()
+  if config.bunnyHop then bunnyHop() end
+  scanChams()
+  cleanChams()
+end)
+
+player.CharacterAdded:Connect(function()
+  char = player.Character
+  rootPart = char:WaitForChild("HumanoidRootPart")
+  humanoid = char:WaitForChild("Humanoid")
+  espCache = {}
+  chamsParts = {}
+end)
+
+stripFootsounds()
+bypassAnalytics()
+smoothPhys()
+
+print("[SPYMM v8.3] Online. All systems loaded.")
